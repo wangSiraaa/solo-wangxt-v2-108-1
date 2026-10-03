@@ -53,6 +53,86 @@ class RoRConfig:
     display_smooth_s: float = 0.0
 
 
+# ---------------------------------------------------------------------------
+# Calibration ledger (pure functions — the ledger rows live in the DB, the
+# correction itself is derived state computed here, never written back).
+# ---------------------------------------------------------------------------
+
+def normalize_calibration(c: dict) -> dict:
+    """Project a calibration record (ORM row or export-payload dict) to the
+    canonical dict the pipeline understands."""
+    params = c.get("params") or {}
+    return {
+        "id": c.get("id"),
+        "channel": c["channel"],
+        "t_start_s": float(c["t_start_s"]),
+        "t_end_s": float(c["t_end_s"]),
+        "formula": c.get("formula", "affine"),
+        "scale": float(c.get("scale", params.get("scale", 1.0))),
+        "offset_c": float(c.get("offset_c", params.get("offset_c", 0.0))),
+        "version": c.get("version"),
+        "status": c.get("status", "active"),
+        "created_by": c.get("created_by", ""),
+    }
+
+
+def find_calibration_conflicts(calibrations: list[dict]) -> list[dict]:
+    """Overlapping *active* ranges on the same channel are a visible conflict.
+
+    The system never silently picks one of two overlapping calibrations: the
+    caller is expected to surface these and refuse derived output until an
+    operator adjudicates (withdraw / supersede).
+    """
+    act = [normalize_calibration(c) for c in calibrations if c.get("status", "active") == "active"]
+    conflicts: list[dict] = []
+    for i in range(len(act)):
+        for j in range(i + 1, len(act)):
+            a, b = act[i], act[j]
+            if a["channel"] != b["channel"]:
+                continue
+            lo = max(a["t_start_s"], b["t_start_s"])
+            hi = min(a["t_end_s"], b["t_end_s"])
+            if lo <= hi:
+                conflicts.append(
+                    {
+                        "channel": a["channel"],
+                        "overlap_t_start_s": lo,
+                        "overlap_t_end_s": hi,
+                        "calibrations": [
+                            {"id": a["id"], "version": a["version"],
+                             "t_start_s": a["t_start_s"], "t_end_s": a["t_end_s"]},
+                            {"id": b["id"], "version": b["version"],
+                             "t_start_s": b["t_start_s"], "t_end_s": b["t_end_s"]},
+                        ],
+                    }
+                )
+    return conflicts
+
+
+def apply_calibrations(
+    t: np.ndarray,
+    temp: np.ndarray,
+    calibrations: list[dict],
+    channel: str,
+) -> np.ndarray:
+    """Corrected copy of ``temp``; measured points only, NaN stays NaN.
+
+    A missing reading has no value to correct — it remains missing, so a
+    dropout can never be disguised as a measurement by calibration.
+    """
+    out = temp.astype(float).copy()
+    measured = ~np.isnan(temp)
+    for c in calibrations:
+        c = normalize_calibration(c)
+        if c["channel"] != channel or c.get("status", "active") != "active":
+            continue
+        if c["formula"] != "affine":
+            raise ValueError(f"unsupported calibration formula: {c['formula']}")
+        m = measured & (t >= c["t_start_s"]) & (t <= c["t_end_s"])
+        out[m] = c["scale"] * temp[m] + c["offset_c"]
+    return out
+
+
 def _linear_fill(
     t: np.ndarray,
     temp: np.ndarray,
@@ -203,11 +283,18 @@ def build_series(
     *,
     ror_cfg: RoRConfig,
     max_gap_fill_s: float,
+    calibrations: list[dict] | None = None,
 ) -> dict:
     """Assemble the full derived series for one batch from raw sample dicts.
 
     ``samples`` items need keys ``t_s``, ``bean_temp_c``, ``env_temp_c``.
     Measured temperatures stay untouched; all derived arrays are separate.
+
+    ``calibrations`` (active ledger entries) produce a *parallel* corrected
+    basis: raw values remain in every point, corrected values are added next
+    to them, and RoR / guide lines are computed on the corrected basis while
+    the raw-basis RoR and guides are kept for side-by-side audit.  Missing
+    readings stay missing on both bases.
     """
     samples = sorted(samples, key=lambda s: s["t_s"])
     t = np.array([s["t_s"] for s in samples], dtype=float)
@@ -220,22 +307,38 @@ def build_series(
         dtype=float,
     )
 
+    cals = [normalize_calibration(c) for c in (calibrations or [])]
+    active = [c for c in cals if c["status"] == "active"]
+    bean_c = apply_calibrations(t, bean, active, "bean")
+    env_c = apply_calibrations(t, env, active, "env")
+
     bean_filled, bean_interp, bean_gaps = _linear_fill(
-        t, bean, max_gap_fill_s, channel="bean"
+        t, bean_c, max_gap_fill_s, channel="bean"
     )
     env_filled, env_interp, env_gaps = _linear_fill(
-        t, env, max_gap_fill_s, channel="env"
+        t, env_c, max_gap_fill_s, channel="env"
     )
+    bean_filled_raw, _, _ = _linear_fill(t, bean, max_gap_fill_s, channel="bean")
+    env_filled_raw, _, _ = _linear_fill(t, env, max_gap_fill_s, channel="env")
 
-    ror = rate_of_rise(t, bean, ror_cfg)
+    ror = rate_of_rise(t, bean_c, ror_cfg)
+    ror_raw = rate_of_rise(t, bean, ror_cfg)
 
     raw_points = [
         {
             "t_s": float(t[i]),
+            # RAW measured values — immutable, exactly as stored.
             "bean_temp_c": None if np.isnan(bean[i]) else float(bean[i]),
             "env_temp_c": None if np.isnan(env[i]) else float(env[i]),
+            # CORRECTED values (== raw where no active calibration covers t).
+            "bean_temp_corrected_c": None if np.isnan(bean_c[i]) else float(bean_c[i]),
+            "env_temp_corrected_c": None if np.isnan(env_c[i]) else float(env_c[i]),
+            # RoR on the corrected basis is the current analytical view...
             "ror_c_per_min": None if np.isnan(ror["ror_raw"][i]) else float(ror["ror_raw"][i]),
             "ror_display": None if np.isnan(ror["ror_display"][i]) else float(ror["ror_display"][i]),
+            # ...while the raw-basis RoR stays available for comparison.
+            "ror_raw_basis_c_per_min": None if np.isnan(ror_raw["ror_raw"][i]) else float(ror_raw["ror_raw"][i]),
+            "ror_display_raw_basis": None if np.isnan(ror_raw["ror_display"][i]) else float(ror_raw["ror_display"][i]),
             "ror_n_points": int(ror["n_points_used"][i]),
             "ror_edge": bool(ror["edge"][i]),
             "is_interpolated": bool(bean_interp[i]),
@@ -243,12 +346,30 @@ def build_series(
         for i in range(len(t))
     ]
 
+    applied = [
+        {
+            "id": c["id"],
+            "channel": c["channel"],
+            "version": c["version"],
+            "t_start_s": c["t_start_s"],
+            "t_end_s": c["t_end_s"],
+            "formula": c["formula"],
+            "scale": c["scale"],
+            "offset_c": c["offset_c"],
+            "created_by": c["created_by"],
+        }
+        for c in active
+    ]
+
     return {
         "raw_points": raw_points,
         # Continuous guide line (measured + flagged interpolated), NaN across
-        # unfilled gaps so the chart renders a break.
+        # unfilled gaps so the chart renders a break.  Corrected basis.
         "guide_bean_temp": [None if np.isnan(v) else float(v) for v in bean_filled],
         "guide_env_temp": [None if np.isnan(v) else float(v) for v in env_filled],
+        # Same guides on the raw basis, for the side-by-side audit view.
+        "guide_bean_temp_raw": [None if np.isnan(v) else float(v) for v in bean_filled_raw],
+        "guide_env_temp_raw": [None if np.isnan(v) else float(v) for v in env_filled_raw],
         "interpolated_t_s": [float(x) for x in t[bean_interp | env_interp]],
         "missing_segments": bean_gaps + env_gaps,
         "ror_window": {
@@ -258,6 +379,12 @@ def build_series(
             "min_points": ror["min_points"],
             "min_span_s": ror["min_span_s"],
             "units": "C/min",
+            "basis": "corrected" if applied else "raw",
+        },
+        "calibration": {
+            "basis": "corrected" if applied else "raw",
+            "applied": applied,
+            "raw_is_immutable": True,
         },
     }
 
@@ -271,7 +398,47 @@ def current_events(events: list[dict]) -> dict[str, dict]:
     return out
 
 
-def phase_metrics(events: list[dict]) -> dict:
+def anchor_temperatures(
+    events: list[dict],
+    points: list[dict],
+    tol_s: float = 10.0,
+) -> dict[str, dict | None]:
+    """Bean temperature at each phase anchor, on BOTH bases.
+
+    Durations never depend on calibration, but the temperature read at an
+    anchor does — so every anchor reports the raw and the corrected value
+    (nearest measured sample within ``tol_s``; interpolated/missing points
+    are never used as a temperature source).
+    """
+    cur = current_events(events)
+    out: dict[str, dict | None] = {}
+    for kind in EVENT_TIME_KEYS:
+        e = cur.get(kind)
+        if e is None:
+            out[kind] = None
+            continue
+        best = None
+        for p in points:
+            if p.get("bean_temp_c") is None:
+                continue
+            d = abs(p["t_s"] - e["t_s"])
+            if d <= tol_s and (best is None or d < best[0]):
+                best = (d, p)
+        if best is None:
+            out[kind] = None
+            continue
+        p = best[1]
+        out[kind] = {
+            "sample_t_s": float(p["t_s"]),
+            "bean_temp_raw_c": float(p["bean_temp_c"]),
+            "bean_temp_corrected_c": float(
+                p.get("bean_temp_corrected_c", p["bean_temp_c"])
+            ),
+        }
+    return out
+
+
+def phase_metrics(events: list[dict], points: list[dict] | None = None) -> dict:
     """Development-time ratio etc., computed over explicit event intervals.
 
     Intervals (all anchored on operator-visible, source-labelled events):
@@ -283,6 +450,8 @@ def phase_metrics(events: list[dict]) -> dict:
 
     Returns ``None`` fields (never a guessed value) when a boundary event is
     missing, plus the exact events used so the computation is auditable.
+    When ``points`` (series raw_points) are given, anchor temperatures are
+    reported on both the raw and the corrected basis.
     """
     cur = current_events(events)
 
@@ -318,6 +487,8 @@ def phase_metrics(events: list[dict]) -> dict:
         "first_crack_window_s": crack_window,
         "total_s": total,
         "development_ratio": ratio,
+        "anchor_temps": anchor_temperatures(events, points) if points is not None else None,
+        "temperature_basis": "raw_and_corrected" if points is not None else None,
         "interval_definition": {
             "drying": "charge -> turning_point",
             "maillard": "turning_point -> first_crack_start",

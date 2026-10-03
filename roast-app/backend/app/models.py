@@ -54,6 +54,9 @@ class Batch(Base):
     events: Mapped[list["Event"]] = relationship(
         back_populates="batch", cascade="all, delete-orphan", order_by="Event.t_s"
     )
+    calibrations: Mapped[list["Calibration"]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan", order_by="Calibration.id"
+    )
 
 
 class Sample(Base):
@@ -97,6 +100,52 @@ class Event(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     batch: Mapped[Batch] = relationship(back_populates="events")
+
+
+class Calibration(Base):
+    """One probe-calibration ledger entry (append-only, status-driven).
+
+    A record says: for ``channel`` ('bean' | 'env') of this batch, measured
+    readings inside ``[t_start_s, t_end_s]`` are corrected as
+    ``corrected = scale * raw + offset_c`` (formula 'affine').
+
+    Lifecycle: draft -> active -> withdrawn | superseded.  Rows are never
+    edited in place and never deleted: a correction of a calibration is a new
+    version (``replaces_id`` -> old row, ``version`` = old + 1); the old row
+    flips to ``superseded`` with ``superseded_by_id`` set.  Raw samples are
+    never touched — calibration is applied at query time only.
+    """
+
+    __tablename__ = "calibrations"
+
+    STATUSES = ("draft", "active", "withdrawn", "superseded")
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id"), index=True)
+    channel: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    t_start_s: Mapped[float] = mapped_column(Float, nullable=False)
+    t_end_s: Mapped[float] = mapped_column(Float, nullable=False)
+    # Correction formula + parameters.  Only 'affine' is supported:
+    # corrected = scale * raw + offset_c.
+    formula: Mapped[str] = mapped_column(String(40), default="affine")
+    scale: Mapped[float] = mapped_column(Float, default=1.0)
+    offset_c: Mapped[float] = mapped_column(Float, default=0.0)
+    created_by: Mapped[str] = mapped_column(String(80), default="operator")
+    note: Mapped[str] = mapped_column(Text, default="")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="draft", index=True)
+    replaces_id: Mapped[int | None] = mapped_column(
+        ForeignKey("calibrations.id"), nullable=True
+    )
+    superseded_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("calibrations.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    status_changed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow
+    )
+
+    batch: Mapped[Batch] = relationship(back_populates="calibrations")
 
 
 _connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}

@@ -3,61 +3,88 @@
 const qs = (p) =>
   new URLSearchParams(Object.entries(p).filter(([, v]) => v !== undefined && v !== null));
 
-export async function getBatches() {
-  const r = await fetch('/api/batches');
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+async function check(r) {
+  if (r.ok) return r.json();
+  const text = await r.text();
+  let detail = null;
+  try {
+    detail = JSON.parse(text)?.detail ?? null;
+  } catch {
+    /* non-JSON error body */
+  }
+  const msg =
+    (detail && (typeof detail === 'string' ? detail : detail.message)) || text || `HTTP ${r.status}`;
+  const err = new Error(msg);
+  err.status = r.status;
+  err.detail = detail; // e.g. {error: 'calibration_conflict', conflicts: [...]}
+  throw err;
 }
 
-export async function seed() {
-  const r = await fetch('/api/seed', { method: 'POST' });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+const get = (url) => fetch(url).then(check);
+const post = (url, body) =>
+  fetch(
+    url,
+    body === undefined
+      ? { method: 'POST' }
+      : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
+  ).then(check);
+
+export function getBatches() {
+  return get('/api/batches');
 }
 
-export async function getSeries(batchId, params = {}) {
-  const r = await fetch(`/api/batches/${batchId}/series?${qs(params)}`);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+export function seed() {
+  return post('/api/seed');
 }
 
-export async function getCompare(a, b, params = {}) {
-  const r = await fetch(`/api/compare?${qs({ a, b, ...params })}`);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+export function getSeries(batchId, params = {}) {
+  return get(`/api/batches/${batchId}/series?${qs(params)}`);
 }
 
-export async function addEvent(batchId, ev) {
-  const r = await fetch(`/api/batches/${batchId}/events`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(ev),
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+export function getCompare(a, b, params = {}) {
+  return get(`/api/compare?${qs({ a, b, ...params })}`);
 }
 
-export async function listEvents(batchId, includeHistory = false) {
-  const r = await fetch(`/api/batches/${batchId}/events?${qs({ include_history: includeHistory })}`);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+export function addEvent(batchId, ev) {
+  return post(`/api/batches/${batchId}/events`, ev);
 }
 
-export async function exportBatch(batchId, params = {}) {
-  const r = await fetch(`/api/batches/${batchId}/export?${qs(params)}`);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+export function listEvents(batchId, includeHistory = false) {
+  return get(`/api/batches/${batchId}/events?${qs({ include_history: includeHistory })}`);
 }
 
-export async function recompute(body) {
-  const r = await fetch('/api/recompute', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+export function exportBatch(batchId, params = {}) {
+  return get(`/api/batches/${batchId}/export?${qs(params)}`);
 }
+
+export function recompute(body) {
+  return post('/api/recompute', body);
+}
+
+// --- calibration ledger -----------------------------------------------------
+
+export function listCalibrations(batchId) {
+  return get(`/api/batches/${batchId}/calibrations`);
+}
+
+export function createCalibration(batchId, body) {
+  return post(`/api/batches/${batchId}/calibrations`, body);
+}
+
+export function activateCalibration(id) {
+  return post(`/api/calibrations/${id}/activate`);
+}
+
+export function withdrawCalibration(id) {
+  return post(`/api/calibrations/${id}/withdraw`);
+}
+
+export const CAL_STATUS_LABELS = {
+  draft: '草稿',
+  active: '已启用',
+  withdrawn: '已撤回',
+  superseded: '已被取代',
+};
 
 export const EVENT_LABELS = {
   charge: '下豆/开火',

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -10,10 +11,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import synth
-from .analysis import RoRConfig, build_series, current_events, phase_metrics
+from .analysis import (
+    RoRConfig,
+    build_series,
+    current_events,
+    find_calibration_conflicts,
+    phase_metrics,
+)
 from .config import CORS_ORIGINS, MAX_GAP_FILL_S
-from .models import Batch, Event, Sample, engine, init_db
-from .schemas import BatchMeta, EventIn, EventOut
+from .models import Batch, Calibration, Event, Sample, engine, init_db
+from .schemas import BatchMeta, CalibrationIn, CalibrationOut, EventIn, EventOut
 
 app = FastAPI(title="Coffee Roast Batch Explorer", version="1.0.0")
 app.add_middleware(
@@ -75,6 +82,54 @@ def _events_as_dicts(batch: Batch, *, include_history: bool) -> list[dict]:
     return rows
 
 
+def _calibrations_as_dicts(batch: Batch) -> list[dict]:
+    return [
+        {
+            "id": c.id,
+            "batch_id": c.batch_id,
+            "channel": c.channel,
+            "t_start_s": c.t_start_s,
+            "t_end_s": c.t_end_s,
+            "formula": c.formula,
+            "scale": c.scale,
+            "offset_c": c.offset_c,
+            "created_by": c.created_by,
+            "note": c.note,
+            "version": c.version,
+            "status": c.status,
+            "replaces_id": c.replaces_id,
+            "superseded_by_id": c.superseded_by_id,
+            "created_at": c.created_at.isoformat(),
+            "status_changed_at": c.status_changed_at.isoformat(),
+        }
+        for c in batch.calibrations
+    ]
+
+
+def _active_calibrations_or_409(batch: Batch) -> list[dict]:
+    """Active calibrations for the batch — or a visible 409 conflict.
+
+    Overlapping active ranges on one channel are never resolved silently:
+    every derived view (series/compare/export) refuses until the operator
+    adjudicates by withdrawing or superseding one of the records.
+    """
+    active = [c for c in _calibrations_as_dicts(batch) if c["status"] == "active"]
+    conflicts = find_calibration_conflicts(active)
+    if conflicts:
+        raise HTTPException(
+            409,
+            detail={
+                "error": "calibration_conflict",
+                "message": (
+                    "同一通道存在有效时间段相交的已启用校准，分析与导出已阻断；"
+                    "请撤回或以新版本取代其中一条后再试。"
+                ),
+                "conflicts": conflicts,
+            },
+        )
+    return active
+
+
 def _series_payload(
     batch: Batch,
     *,
@@ -83,17 +138,20 @@ def _series_payload(
     max_gap_fill_s: float,
     include_history: bool,
 ) -> dict[str, Any]:
+    calibrations = _active_calibrations_or_409(batch)
     series = build_series(
         _samples_as_dicts(batch),
         ror_cfg=RoRConfig(window_s=window_s, display_smooth_s=display_smooth_s),
         max_gap_fill_s=max_gap_fill_s,
+        calibrations=calibrations,
     )
     events = _events_as_dicts(batch, include_history=include_history)
     return {
         "batch": BatchMeta.model_validate(batch).model_dump(mode="json"),
         "series": series,
         "events": events,
-        "metrics": phase_metrics(events),
+        "metrics": phase_metrics(events, series["raw_points"]),
+        "calibration": series["calibration"],
         "params": {
             "ror_window_s": window_s,
             "ror_display_smooth_s": display_smooth_s,
@@ -209,6 +267,103 @@ def list_events(batch_id: int, include_history: bool = Query(False)) -> list[Eve
 
 
 # ---------------------------------------------------------------------------
+# calibration ledger: append-only records, draft -> active -> withdrawn |
+# superseded.  Rows are never edited or deleted; a correction is a new
+# version linked by replaces_id / superseded_by_id.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/batches/{batch_id}/calibrations", response_model=list[CalibrationOut])
+def list_calibrations(batch_id: int) -> list[Calibration]:
+    """Full ledger for the batch — every status, so withdrawn/superseded
+    versions and what they produced stay auditable."""
+    with Session(engine) as s:
+        b = _get_batch(s, batch_id)
+        rows = list(
+            s.scalars(
+                select(Calibration)
+                .where(Calibration.batch_id == b.id)
+                .order_by(Calibration.id)
+            )
+        )
+        for r in rows:  # detach-safe: load all columns before session closes
+            _ = r.status_changed_at
+        return rows
+
+
+@app.post(
+    "/api/batches/{batch_id}/calibrations",
+    response_model=CalibrationOut,
+    status_code=201,
+)
+def create_calibration(batch_id: int, body: CalibrationIn) -> Calibration:
+    """Create a DRAFT calibration.  With ``replaces_id`` the draft becomes the
+    next version of that record (version = old + 1); activation then
+    supersedes the old row atomically."""
+    with Session(engine) as s:
+        _get_batch(s, batch_id)
+        version = 1
+        if body.replaces_id is not None:
+            old = s.get(Calibration, body.replaces_id)
+            if old is None or old.batch_id != batch_id:
+                raise HTTPException(404, "replaces_id does not name a calibration of this batch")
+            if old.channel != body.channel:
+                raise HTTPException(422, "a new version must keep the same channel")
+            version = old.version + 1
+        row = Calibration(
+            batch_id=batch_id,
+            version=version,
+            status="draft",
+            **body.model_dump(),
+        )
+        s.add(row)
+        s.commit()
+        s.refresh(row)
+        return row
+
+
+def _transition(cal_id: int, action: str) -> Calibration:
+    with Session(engine) as s:
+        row = s.get(Calibration, cal_id)
+        if row is None:
+            raise HTTPException(404, f"calibration {cal_id} not found")
+        if action == "activate":
+            if row.status != "draft":
+                raise HTTPException(
+                    409, f"only a draft can be activated (current status: {row.status})"
+                )
+            # Atomic supersede: the replaced row flips in the same commit.
+            if row.replaces_id is not None:
+                old = s.get(Calibration, row.replaces_id)
+                if old is not None and old.status == "active":
+                    old.status = "superseded"
+                    old.superseded_by_id = row.id
+                    old.status_changed_at = datetime.utcnow()
+            row.status = "active"
+        elif action == "withdraw":
+            if row.status not in ("draft", "active"):
+                raise HTTPException(
+                    409, f"only a draft or active record can be withdrawn (current: {row.status})"
+                )
+            row.status = "withdrawn"
+        else:  # pragma: no cover - guarded by the routes below
+            raise HTTPException(400, f"unknown action {action}")
+        row.status_changed_at = datetime.utcnow()
+        s.commit()
+        s.refresh(row)
+        return row
+
+
+@app.post("/api/calibrations/{cal_id}/activate", response_model=CalibrationOut)
+def activate_calibration(cal_id: int) -> Calibration:
+    return _transition(cal_id, "activate")
+
+
+@app.post("/api/calibrations/{cal_id}/withdraw", response_model=CalibrationOut)
+def withdraw_calibration(cal_id: int) -> Calibration:
+    return _transition(cal_id, "withdraw")
+
+
+# ---------------------------------------------------------------------------
 # comparison (no causal claims) + export / recompute
 # ---------------------------------------------------------------------------
 
@@ -252,9 +407,11 @@ def compare(
 
 @app.get("/api/batches/{batch_id}/export")
 def export_batch(batch_id: int, window_s: float = 30.0, display_smooth_s: float = 12.0) -> dict[str, Any]:
-    """Self-contained export: raw samples, sourced events, parameters, and the
-    derived phase metrics.  The metrics can be reproduced from raw + events +
-    the stated window (see /api/recompute)."""
+    """Self-contained export: raw samples, sourced events, the exact
+    calibration versions applied (plus the full ledger for audit),
+    parameters, and the derived phase metrics.  The metrics can be
+    reproduced from raw + events + calibrations + the stated window
+    (see /api/recompute)."""
     with Session(engine) as s:
         b = _get_batch(s, batch_id)
         payload = _series_payload(
@@ -264,11 +421,20 @@ def export_batch(batch_id: int, window_s: float = 30.0, display_smooth_s: float 
             max_gap_fill_s=MAX_GAP_FILL_S,
             include_history=True,
         )
-        payload["export_version"] = 1
+        payload["export_version"] = 2
+        # The exact calibration versions this export was computed with —
+        # recompute must use THESE, not whatever is active later.
+        payload["calibrations"] = payload["calibration"]["applied"]
+        payload["calibration_ledger"] = _calibrations_as_dicts(b)
         payload["reproducibility"] = {
             "raw_samples_are_source_of_truth": True,
-            "metrics_depend_on": ["raw_samples", "current(non-superseded) events", "ror_window_s"],
-            "pipeline": "numpy centred least-squares RoR; linear gap fill flagged",
+            "metrics_depend_on": [
+                "raw_samples",
+                "current(non-superseded) events",
+                "ror_window_s",
+                "calibrations (exact versions embedded above)",
+            ],
+            "pipeline": "numpy centred least-squares RoR; linear gap fill flagged; affine calibration on measured points only",
         }
         return payload
 
@@ -278,14 +444,27 @@ def recompute(payload: dict[str, Any]) -> dict[str, Any]:
     """Re-derive series + metrics from an export-style payload.
 
     Used to verify an export reproduces every stage metric without touching
-    the database.  Body: {"samples": [...], "events": [...], "params": {...}}.
+    the database.  Body: {"samples": [...], "events": [...], "params": {...},
+    "calibrations": [...]}.  The calibration versions embedded in the export
+    are applied as-is; overlapping active ranges are a 409 here too.
     """
     try:
         samples = payload["samples"]
         events = payload.get("events", [])
         params = payload.get("params", {})
+        calibrations = payload.get("calibrations", [])
     except KeyError as exc:
         raise HTTPException(422, f"missing field: {exc}")
+    conflicts = find_calibration_conflicts(calibrations)
+    if conflicts:
+        raise HTTPException(
+            409,
+            detail={
+                "error": "calibration_conflict",
+                "message": "导出载荷中的已启用校准存在相交有效段，独立重算被阻断。",
+                "conflicts": conflicts,
+            },
+        )
     cfg = RoRConfig(
         window_s=float(params.get("ror_window_s", 30.0)),
         display_smooth_s=float(params.get("ror_display_smooth_s", 12.0)),
@@ -294,11 +473,13 @@ def recompute(payload: dict[str, Any]) -> dict[str, Any]:
         samples,
         ror_cfg=cfg,
         max_gap_fill_s=float(params.get("max_gap_fill_s", MAX_GAP_FILL_S)),
+        calibrations=calibrations,
     )
     return {
         "series": series,
-        "metrics": phase_metrics(events),
+        "metrics": phase_metrics(events, series["raw_points"]),
         "current_events": current_events(events),
+        "calibration": series["calibration"],
     }
 
 

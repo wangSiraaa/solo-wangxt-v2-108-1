@@ -67,6 +67,12 @@
     payloads.forEach((pl, bi) => {
       const c = PALETTE[bi % PALETTE.length];
       const pts = pl.series.raw_points;
+      const applied = pl.calibration?.applied || [];
+      const calibrated = applied.length > 0;
+      const zip = (arr) =>
+        pts
+          .map((p, i) => [p.t_s, arr?.[i]])
+          .filter(([, v]) => v !== null && v !== undefined);
       const measured = pts
         .filter((p) => !p.is_interpolated && p.bean_temp_c !== null)
         .map((p) => [p.t_s, p.bean_temp_c]);
@@ -141,6 +147,47 @@
         z: 1,
       });
 
+      // --- calibration overlay: corrected vs raw on the SAME chart ---------
+      if (calibrated) {
+        // corrected bean guide (primary analytical view)
+        series.push({
+          name: bi === 0 ? '豆温(校正后)' : `豆温校正 ${pl.batch.name}`,
+          type: 'line',
+          showSymbol: false,
+          data: zip(pl.series.guide_bean_temp),
+          connectNulls: false,
+          lineStyle: { width: 2.2, color: '#5fd08a', type: 'solid' },
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          z: 5,
+        });
+        // raw-basis RoR kept visible next to the corrected RoR
+        series.push({
+          name: bi === 0 ? 'RoR(原始口径)' : `RoR原始 ${pl.batch.name}`,
+          type: 'line',
+          showSymbol: false,
+          data: pair(pts, 'ror_display_raw_basis'),
+          connectNulls: false,
+          lineStyle: { width: 1.2, color: c, type: 'dashed', opacity: 0.6 },
+          xAxisIndex: 0,
+          yAxisIndex: 1,
+          z: 1,
+        });
+        if (applied.some((k) => k.channel === 'env')) {
+          series.push({
+            name: bi === 0 ? '环温(校正后)' : `环温校正 ${pl.batch.name}`,
+            type: 'line',
+            showSymbol: false,
+            data: zip(pl.series.guide_env_temp),
+            connectNulls: false,
+            lineStyle: { width: 1.4, color: '#5fd08a', type: 'dotted' },
+            xAxisIndex: 0,
+            yAxisIndex: 0,
+            z: 2,
+          });
+        }
+      }
+
       // events as markLines on first bean series — attach to measured scatter
       const markLines = pl.events
         .filter((e) => e.event_type !== 'damper_change')
@@ -176,6 +223,26 @@
         symbol: 'none',
         data: markLines,
       };
+      if (calibrated) {
+        // shaded effective ranges of the applied calibration versions
+        target.markArea = {
+          silent: true,
+          itemStyle: { color: 'rgba(95, 208, 138, 0.07)' },
+          data: applied.map((k) => [
+            {
+              xAxis: k.t_start_s,
+              label: {
+                show: true,
+                position: 'insideTop',
+                color: '#5fd08a',
+                fontSize: 10,
+                formatter: `校准${k.channel === 'bean' ? '豆温' : '环温'} v${k.version}`,
+              },
+            },
+            { xAxis: k.t_end_s },
+          ]),
+        };
+      }
     });
 
     return {
@@ -189,7 +256,15 @@
         valueFormatter: (v) => (v === null || v === undefined ? '缺测' : Number(v).toFixed(1)),
       },
       legend: {
-        data: ['豆温实测点', '插值段(非实测)', '环境温度', '温升率 RoR'],
+        data: [
+          '豆温实测点',
+          '插值段(非实测)',
+          '环境温度',
+          '温升率 RoR',
+          '豆温(校正后)',
+          'RoR(原始口径)',
+          '环温(校正后)',
+        ],
         textStyle: { color: '#a89b8c' },
         top: 0,
       },

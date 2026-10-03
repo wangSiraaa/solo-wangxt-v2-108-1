@@ -34,6 +34,21 @@
   `superseded_by_id`，不删除；自动建议记 `source=auto`，人工记 `source=manual`+`created_by`；
 - 风门变化允许多条并存（离散操作点），金色虚线标出。
 
+### 探针校准 —— 本地账本，只追加，永不改写原始采样
+针对维护前后可追溯的零点/比例漂移，系统提供**校准账本**（`calibrations` 表）：
+
+- 每条记录：通道（豆温/环温）、有效时间段、校正公式与参数（`affine`：校正 = scale × 原始 + offset）、
+  创建人、版本、状态；记录创建后不可编辑、不可删除，修正 = 新版本（`replaces_id` 链接，版本号 +1）。
+- 状态机：`草稿 → 已启用 → 已撤回 / 已被取代`；非法流转返回 409。
+- 校正只作用于**查询时的派生视图**：`samples` 原始读数、缺测段、人工事件永远不改写；
+  缺测点在校正口径下仍是缺测（NaN 无可校正），插值段仍标记非实测。
+- **冲突不静默裁决**：同一通道两条已启用校准的有效段相交时，曲线/RoR/指标/对比/导出/独立重算
+  一律返回 `409 calibration_conflict` 并给出相交区间与涉及版本，必须撤回或取代其一后才恢复。
+- 曲线、RoR、阶段指标、导出与重算都带 `calibration.applied`（精确到版本）以及
+  原始/校正双口径（`bean_temp_c` vs `bean_temp_corrected_c`、`ror_c_per_min` vs
+  `ror_raw_basis_c_per_min`、锚点温度 raw→corrected）；前端同图叠加校正曲线、原始 RoR 对照
+  与校准有效段阴影，账本面板展示完整历史。
+
 ### 发展时间比 —— 明确区间
 | 指标 | 区间 |
 |---|---|
@@ -81,9 +96,15 @@
     DATABASE_URL=postgresql+psycopg2://roast:roast@localhost:5432/roast pytest
 
 界面“缺测与插值审计 · 导出可复现”面板一键完成：
-1. 导出 JSON（原始采样 + 全量事件含已取代行 + 参数 + 阶段指标）；
-2. 调 `/api/recompute` 从原始数据独立重算，逐指标比对（脱水/梅纳/发展/一爆/总时长/DTR）；
+1. 导出 JSON（原始采样 + 全量事件含已取代行 + 参数 + 阶段指标 + 所用校准版本与完整账本）；
+2. 调 `/api/recompute` 从原始数据独立重算，逐指标比对（脱水/梅纳/发展/一爆/总时长/DTR），
+   并按载荷内同一校准版本复算校正曲线与 RoR；
 3. 再用翻倍窗口、不同平滑重取曲线，逐点比对原始豆温/环温**完全不变**。
+
+校准验收（`tests/test_calibration.py`）：启用非重叠校准后校正曲线/RoR/锚点温度按新口径变化而
+原始温度逐点不变；两条相交已启用校准使分析与导出返回 409 并显示相交区间，裁决后只用明确版本；
+长失联与插值标记在校正后仍保持断档/非实测身份；撤回或被取代的旧版本留在账本与旧导出中可审计；
+刷新后导出载荷用同一校准版本独立重算结果一致。
 
 ## API 摘要
 
@@ -91,14 +112,16 @@
 |---|---|---|
 | GET | `/api/batches` | 批次列表 |
 | POST | `/api/seed` | 生成两个合成批次 |
-| GET | `/api/batches/{id}/series?window_s&display_smooth_s&max_gap_fill_s` | 曲线+RoR+指标 |
+| GET | `/api/batches/{id}/series?window_s&display_smooth_s&max_gap_fill_s` | 曲线+RoR+指标（校准冲突时 409） |
 | GET/POST | `/api/batches/{id}/events[?include_history=true]` | 事件列表/人工修正（只追加） |
+| GET/POST | `/api/batches/{id}/calibrations` | 校准账本（全状态历史）/新建草稿（可带 `replaces_id` 存为新版本） |
+| POST | `/api/calibrations/{id}/activate` `/withdraw` | 草稿→启用（原子取代旧版本）/撤回 |
 | GET | `/api/compare?a=&b=` | 双批次叠加（含非因果声明） |
-| GET | `/api/batches/{id}/export` | 自包含导出 |
-| POST | `/api/recompute` | 从导出载荷独立重算全部派生指标 |
+| GET | `/api/batches/{id}/export` | 自包含导出（含所用校准版本与完整账本） |
+| POST | `/api/recompute` | 从导出载荷独立重算全部派生指标（按载荷内校准版本） |
 
 ## 目录
 
     backend/app/  config.py models.py analysis.py synth.py schemas.py main.py
     frontend/src/ App.svelte lib/RoastChart.svelte lib/api.js
-    tests/        test_analysis.py test_api.py（双后端同一套用例）
+    tests/        test_analysis.py test_api.py test_calibration.py（双后端同一套用例）
