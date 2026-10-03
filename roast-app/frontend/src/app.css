@@ -66,3 +66,19 @@ label.inline { display: inline-flex; align-items: center; gap: 6px; margin-right
   padding: 8px 12px;
   font-size: 13px;
 }
+.conflict {
+  border-color: #8a3b2e;
+  background: #2c1a16;
+}
+.conflict h2 { color: #ef9a8a; }
+.conflict-group {
+  border: 1px solid #5a332b;
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 8px 0;
+}
+.tag.cal-draft { color: #a89b8c; }
+.tag.cal-active { color: #7fd99a; border-color: #2f6b44; }
+.tag.cal-withdrawn { color: #e39a8a; border-color: #6b3a30; }
+.tag.cal-superseded { color: #c9a35f; border-color: #6b5326; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }

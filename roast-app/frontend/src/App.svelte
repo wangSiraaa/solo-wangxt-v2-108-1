@@ -10,7 +10,12 @@
     listEvents,
     exportBatch,
     recompute,
+    listCalibrations,
+    createCalibration,
+    calAction,
     EVENT_LABELS,
+    CAL_STATUS_LABELS,
+    CAL_CHANNEL_LABELS,
     fmtTime,
   } from './lib/api.js';
 
@@ -36,6 +41,27 @@
   let newEventDamper = '';
   let showHistory = false;
 
+  // calibration ledger
+  let calibrations = [];
+  let calConflict = null; // 409 detail: overlapping active calibrations
+  let calChoice = {}; // conflict group index -> chosen calibration id
+  let calSelection = []; // explicit adjudication (ids); empty = auto
+  let calEditing = null; // record being superseded (new-version form)
+  let showCalHistory = false;
+  let calForm = blankCalForm();
+
+  function blankCalForm() {
+    return {
+      channel: 'bean',
+      from: '0:00',
+      to: '2:00',
+      gain: 1.0,
+      offset: 0.0,
+      by: '烘焙负责人',
+      note: '',
+    };
+  }
+
   // export verification
   let verifyResult = null;
 
@@ -46,6 +72,14 @@
     ['first_crack_window_s', '一爆持续', '一爆开始 → 一爆结束'],
     ['total_s', '总时长', '下豆 → 出锅'],
   ];
+
+  const anchorLabels = {
+    charge: '下豆',
+    turning_point: '回温点',
+    first_crack_start: '一爆开始',
+    first_crack_end: '一爆结束',
+    drop: '出锅',
+  };
 
   onMount(loadBatches);
 
@@ -76,6 +110,10 @@
     }
   }
 
+  function calIdParam() {
+    return calSelection.length ? { cal_ids: calSelection.join(',') } : {};
+  }
+
   async function refresh() {
     if (!selA) return;
     loading = '加载曲线…';
@@ -85,8 +123,10 @@
       window_s: windowS,
       display_smooth_s: smoothS,
       max_gap_fill_s: maxGapFillS,
+      ...calIdParam(),
     };
     try {
+      calConflict = null;
       dataA = await getSeries(selA, { ...params, include_history: showHistory });
       eventHistory = await listEvents(selA, showHistory);
       if (view === 'compare' && selB && selB !== selA) {
@@ -97,16 +137,35 @@
         dataB = null;
       }
     } catch (e) {
-      error = e.message;
+      if (e.status === 409 && e.payload?.detail?.error === 'calibration_conflict') {
+        // Analysis is BLOCKED until an explicit adjudication — show the
+        // conflict, not a silently-picked curve.
+        calConflict = e.payload.detail;
+        calChoice = {};
+        dataA = null;
+        dataB = null;
+        comparePayload = null;
+      } else {
+        error = e.message;
+      }
     } finally {
+      try {
+        calibrations = await listCalibrations(selA);
+      } catch {
+        /* ledger panel keeps last state */
+      }
       loading = '';
     }
   }
 
   function parseMMSS(str) {
-    const m = /^(\d+):([0-5]?\d)$/.exec(str.trim());
+    const m = /^(\d+):([0-5]?\d)$/.exec(String(str).trim());
     if (!m) return null;
     return Number(m[1]) * 60 + Number(m[2]);
+  }
+
+  function fmtInput(s) {
+    return `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
   }
 
   async function submitEvent() {
@@ -143,6 +202,109 @@
     }
   }
 
+  // -------------------------------------------------------------------------
+  // calibration ledger actions
+  // -------------------------------------------------------------------------
+
+  async function submitCalibration() {
+    const from = parseMMSS(calForm.from);
+    const to = parseMMSS(calForm.to);
+    if (from === null || to === null) {
+      error = '有效时间段格式应为 m:ss，例如 1:30';
+      return;
+    }
+    const body = {
+      channel: calForm.channel,
+      valid_from_s: from,
+      valid_to_s: to,
+      formula: 'linear',
+      gain: Number(calForm.gain),
+      offset: Number(calForm.offset),
+      created_by: calForm.by.trim() || '操作员(界面)',
+      note: calForm.note,
+    };
+    loading = calEditing ? '生成新版本草稿…' : '保存校准草稿…';
+    error = '';
+    try {
+      if (calEditing) {
+        await calAction(calEditing.id, 'supersede', body);
+        calEditing = null;
+      } else {
+        await createCalibration(selA, body);
+      }
+      calForm = blankCalForm();
+      await refresh();
+    } catch (e) {
+      error = e.message;
+    } finally {
+      loading = '';
+    }
+  }
+
+  async function calDo(id, action) {
+    loading = '更新校准状态…';
+    error = '';
+    try {
+      await calAction(id, action, { acted_by: '操作员(界面)' });
+      await refresh();
+    } catch (e) {
+      error = e.message;
+    } finally {
+      loading = '';
+    }
+  }
+
+  function startNewVersion(cal) {
+    calEditing = cal;
+    calForm = {
+      channel: cal.channel,
+      from: fmtInput(cal.valid_from_s),
+      to: fmtInput(cal.valid_to_s),
+      gain: cal.gain,
+      offset: cal.offset,
+      by: calForm.by,
+      note: `取代 #${cal.id} v${cal.version} 的新版本`,
+    };
+  }
+
+  function cancelNewVersion() {
+    calEditing = null;
+    calForm = blankCalForm();
+  }
+
+  // Explicit adjudication of an overlap conflict: keep every non-conflicted
+  // active record plus exactly one chosen version per conflict group.
+  function conflictedIds() {
+    return new Set(
+      (calConflict?.conflicts || []).flatMap((c) => c.candidates.map((x) => x.id))
+    );
+  }
+
+  async function applyAdjudication() {
+    const groups = calConflict?.conflicts || [];
+    const chosen = groups.map((_, i) => Number(calChoice[i])).filter(Boolean);
+    if (chosen.length < groups.length) {
+      error = '请为每组冲突各选择一个版本后再裁决';
+      return;
+    }
+    const keep = (calConflict.active_ids || []).filter((id) => !conflictedIds().has(id));
+    calSelection = [...keep, ...chosen];
+    calConflict = null;
+    error = '';
+    await refresh();
+  }
+
+  async function resetCalSelection() {
+    calSelection = [];
+    await refresh();
+  }
+
+  function calFormulaText(c) {
+    const g = c.gain ?? c.params?.gain;
+    const o = c.offset ?? c.params?.offset;
+    return `${g}×T ${o >= 0 ? '+' : '−'} ${Math.abs(o)}`;
+  }
+
   async function verifyExport() {
     loading = '导出并重算校验…';
     error = '';
@@ -151,6 +313,7 @@
       const ex = await exportBatch(selA, {
         window_s: windowS,
         display_smooth_s: smoothS,
+        ...calIdParam(),
       });
       const rc = await recompute({
         samples: ex.series.raw_points.map((p) => ({
@@ -160,6 +323,7 @@
         })),
         events: ex.events,
         params: ex.params,
+        calibrations: ex.calibration.applied,
       });
       const keys = Object.keys(ex.metrics).filter(
         (k) => k.endsWith('_s') || k === 'development_ratio'
@@ -175,13 +339,42 @@
         window_s: windowS * 2,
         display_smooth_s: smoothS === 0 ? 30 : 0,
         max_gap_fill_s: maxGapFillS,
+        ...calIdParam(),
       });
       const sig = (arr) =>
         JSON.stringify(arr.map((p) => [p.t_s, p.bean_temp_c, p.env_temp_c]));
       const rawSame = sig(ex.series.raw_points) === sig(alt.series.raw_points);
-      verifyResult = { rows, rawSame, exportObj: ex };
+      // Independent recompute with the SAME calibration versions must
+      // reproduce the corrected view point by point.
+      const calSig = (arr) =>
+        JSON.stringify(
+          arr.map((p) => [
+            p.t_s,
+            p.bean_temp_cal_c,
+            p.env_temp_cal_c,
+            p.ror_cal_c_per_min,
+            p.is_interpolated,
+          ])
+        );
+      const calSame = calSig(ex.series.raw_points) === calSig(rc.series.raw_points);
+      const calIdsMatch =
+        JSON.stringify((rc.calibration?.applied || []).map((c) => [c.id, c.version])) ===
+        JSON.stringify((ex.calibration?.applied || []).map((c) => [c.id, c.version]));
+      verifyResult = {
+        rows,
+        rawSame,
+        calSame,
+        calIdsMatch,
+        calInfo: ex.calibration,
+        exportObj: ex,
+      };
     } catch (e) {
-      error = e.message;
+      if (e.status === 409 && e.payload?.detail?.error === 'calibration_conflict') {
+        calConflict = e.payload.detail;
+        dataA = null;
+      } else {
+        error = e.message;
+      }
     } finally {
       loading = '';
     }
@@ -245,7 +438,7 @@
       </div>
       <div>
         <div class="muted">批次 A</div>
-        <select bind:value={selA} on:change={refresh}>
+        <select bind:value={selA} on:change={() => { calSelection = []; refresh(); }}>
           {#each batches as b}
             <option value={b.id}>{b.name} · {b.bean}</option>
           {/each}
@@ -311,6 +504,51 @@
     </div>
   </section>
 
+  {#if calConflict}
+    <section class="panel conflict">
+      <h2>⛔ 校准冲突 —— 分析与导出已阻断，等待明确裁决</h2>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">
+        {calConflict.message} 系统不会静默挑选任何一条记录。
+      </div>
+      {#each calConflict.conflicts as group, gi}
+        <div class="conflict-group">
+          <div>
+            通道 <b>{CAL_CHANNEL_LABELS[group.channel] || group.channel}</b> ·
+            冲突范围
+            {#if group.overlap_from_s !== null}
+              <b>{fmtTime(group.overlap_from_s)} – {fmtTime(group.overlap_to_s)}</b>
+            {:else}
+              {fmtTime(group.from_s)} – {fmtTime(group.to_s)}（链式重叠）
+            {/if}
+          </div>
+          {#each group.candidates as cand}
+            <label class="inline" style="display:flex;margin:4px 0">
+              <input type="radio" bind:group={calChoice[gi]} value={cand.id} />
+              <span>
+                #{cand.id} v{cand.version} ·
+                {fmtTime(cand.valid_from_s)}–{fmtTime(cand.valid_to_s)} ·
+                {calFormulaText(cand)} · 创建人 {cand.created_by}
+              </span>
+            </label>
+          {/each}
+        </div>
+      {/each}
+      <div class="row" style="margin-top:8px">
+        <button on:click={applyAdjudication}>按所选版本裁决并重新分析</button>
+        <span class="muted" style="font-size:12px;align-self:center">
+          未卷入冲突的启用记录将一并保留；也可以在下方账本中撤回其一后自动解除。
+        </span>
+      </div>
+    </section>
+  {/if}
+
+  {#if calSelection.length > 0 && !calConflict}
+    <div class="warn" style="display:flex;gap:10px;align-items:center">
+      <span>当前为<b>显式裁决</b>视图：仅使用校准 {calSelection.map((i) => '#' + i).join(', ')}。</span>
+      <button class="ghost" on:click={resetCalSelection}>恢复自动（全部启用记录）</button>
+    </div>
+  {/if}
+
   {#if dataA}
     <section class="panel">
       <RoastChart {chartPayloads} {windowS} {smoothS} />
@@ -320,10 +558,116 @@
         <span class="tag">细点线＝环境温度</span>
         <span class="tag">金色竖虚线＝风门变化</span>
         <span class="tag">曲线断档＝缺测未桥接</span>
+        {#if dataA.calibration?.applied?.length}
+          <span class="tag">实线＝校正口径 · 灰虚线＝原始口径</span>
+          <span class="tag">金色底纹＝校准有效段（标注 id/版本）</span>
+        {/if}
       </div>
       {#if comparePayload}
         <div class="warn" style="margin-top:8px">{comparePayload.interpretation}</div>
       {/if}
+    </section>
+
+    <section class="panel">
+      <h2>校准账本（批次 A）· 只增不改 · 原始采样永不可改写</h2>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">
+        每条记录含通道、有效时间段、校正公式与参数、创建人、版本与状态；
+        生命周期：草稿 → 启用 → 撤回 / 被新版本取代，全部变迁留痕。校正只在查询时派生视图，
+        缺测段与插值标记在校正后保持原身份。
+      </div>
+
+      <div class="row" style="align-items:flex-end;gap:8px">
+        <div>
+          <div class="muted">通道</div>
+          <select bind:value={calForm.channel}>
+            <option value="bean">豆温</option>
+            <option value="env">环境温度</option>
+          </select>
+        </div>
+        <div>
+          <div class="muted">有效起 m:ss</div>
+          <input bind:value={calForm.from} style="width:70px" />
+        </div>
+        <div>
+          <div class="muted">有效止 m:ss</div>
+          <input bind:value={calForm.to} style="width:70px" />
+        </div>
+        <div>
+          <div class="muted">比例 gain</div>
+          <input type="number" step="0.01" bind:value={calForm.gain} style="width:80px" />
+        </div>
+        <div>
+          <div class="muted">零点 offset °C</div>
+          <input type="number" step="0.1" bind:value={calForm.offset} style="width:80px" />
+        </div>
+        <div>
+          <div class="muted">创建人</div>
+          <input bind:value={calForm.by} style="width:110px" />
+        </div>
+        <div>
+          <div class="muted">备注</div>
+          <input bind:value={calForm.note} style="width:150px" placeholder="维护/复测依据" />
+        </div>
+        <button on:click={submitCalibration}>
+          {calEditing ? `生成取代 #${calEditing.id} 的新版本草稿` : '录入校准草稿'}
+        </button>
+        {#if calEditing}
+          <button class="ghost" on:click={cancelNewVersion}>取消取代</button>
+        {/if}
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        公式：corrected = gain × raw + offset（覆盖零点与比例漂移）。新记录一律先为草稿，需显式「启用」才参与分析。
+      </div>
+
+      <table style="margin-top:10px">
+        <tr>
+          <th># / 版本</th><th>通道</th><th>有效段</th><th>公式</th><th>创建人</th>
+          <th>状态</th><th>操作</th>
+        </tr>
+        {#each calibrations as c}
+          <tr style={c.status === 'withdrawn' || c.status === 'superseded' ? 'opacity:.5' : ''}>
+            <td>#{c.id} · v{c.version}</td>
+            <td>{CAL_CHANNEL_LABELS[c.channel]}</td>
+            <td>{fmtTime(c.valid_from_s)} – {fmtTime(c.valid_to_s)}</td>
+            <td style="font-size:12px">{calFormulaText(c)}</td>
+            <td>{c.created_by}</td>
+            <td>
+              <span class="tag cal-{c.status}">{CAL_STATUS_LABELS[c.status]}</span>
+              {#if c.superseded_by_id}
+                <span class="muted" style="font-size:11px">→ #{c.superseded_by_id}</span>
+              {/if}
+            </td>
+            <td style="white-space:nowrap">
+              {#if c.status === 'draft'}
+                <button class="ghost" on:click={() => calDo(c.id, 'activate')}>启用</button>
+                <button class="ghost" on:click={() => calDo(c.id, 'withdraw')}>撤回</button>
+              {:else if c.status === 'active'}
+                <button class="ghost" on:click={() => calDo(c.id, 'withdraw')}>撤回</button>
+                <button class="ghost" on:click={() => startNewVersion(c)}>新版本</button>
+              {:else}
+                <span class="muted" style="font-size:11px">仅审计</span>
+              {/if}
+            </td>
+          </tr>
+          {#if showCalHistory}
+            {#each c.history as h}
+              <tr class="muted" style="font-size:11px;opacity:.75">
+                <td></td>
+                <td colspan="6">
+                  {h.from_status ?? '∅'} → {CAL_STATUS_LABELS[h.to_status] || h.to_status}
+                  · {h.acted_by} · {h.note} · {new Date(h.created_at).toLocaleString()}
+                </td>
+              </tr>
+            {/each}
+          {/if}
+        {/each}
+        {#if calibrations.length === 0}
+          <tr><td colspan="7" class="muted">暂无校准记录</td></tr>
+        {/if}
+      </table>
+      <label class="inline" style="margin-top:6px">
+        <input type="checkbox" bind:checked={showCalHistory} /> 显示状态变迁历史（只追加，不可改写）
+      </label>
     </section>
 
     <section class="row">
@@ -334,6 +678,13 @@
             <div style="flex:1;min-width:260px">
               <div class="muted" style="margin-bottom:4px">
                 {i === 0 ? 'A' : 'B'} · {pl.batch.name}
+                {#if pl.calibration?.mode === 'corrected'}
+                  <span class="tag cal-active">
+                    口径：校正 {pl.calibration.applied.map((c) => `#${c.id}v${c.version}`).join(' ')}
+                  </span>
+                {:else}
+                  <span class="tag">口径：原始（无生效校准）</span>
+                {/if}
               </div>
               <table>
                 <tr><th>阶段</th><th>区间定义</th><th>时长</th><th>来源</th></tr>
@@ -372,6 +723,18 @@
                   <td></td>
                 </tr>
               </table>
+              {#if pl.metrics.anchor_temps_c && Object.keys(pl.metrics.anchor_temps_c).length}
+                <div style="font-size:12px;margin-top:6px">
+                  <span class="muted">锚点豆温（原始 → 校正）：</span>
+                  {#each Object.entries(pl.metrics.anchor_temps_c) as [kind, v]}
+                    <span class="tag">
+                      {anchorLabels[kind] || kind}
+                      {v.raw_bean_c !== null ? v.raw_bean_c.toFixed(1) : '—'} →
+                      {v.cal_bean_c !== null ? v.cal_bean_c.toFixed(1) : '—'}°C{v.on_interpolated_segment ? ' ⚠插值段' : ''}
+                    </span>
+                  {/each}
+                </div>
+              {/if}
             </div>
           {/each}
         </div>
@@ -456,12 +819,18 @@
             实测豆温 {dataA.series.raw_points.filter((p) => p.bean_temp_c !== null).length} /
             总点 {dataA.series.raw_points.length}；
             插值点 {dataA.series.interpolated_t_s.length} 个，仅用于引导线，不写回原始采样表。
+            校准不改写原始采样；缺测段与插值标记在校正后保持断档 / 非实测身份。
           </div>
         </div>
         <div style="flex:1;min-width:280px">
-          <button on:click={verifyExport}>
+          <button on:click={verifyExport} disabled={!!calConflict}>
             ② 导出 JSON 并用 /api/recompute 重算全部阶段指标
           </button>
+          {#if calConflict}
+            <div class="muted" style="font-size:12px;margin-top:4px">
+              存在未裁决的校准冲突，导出已阻断。
+            </div>
+          {/if}
           {#if verifyResult}
             <table style="margin-top:10px">
               <tr><th>指标</th><th>导出值</th><th>独立重算</th><th>一致</th></tr>
@@ -474,12 +843,27 @@
                 </tr>
               {/each}
             </table>
-            <div style="margin-top:8px">
-              <span class="{verifyResult.rawSame ? '' : 'warn'}">
+            <div style="margin-top:8px;font-size:13px">
+              <div>
                 改变窗口/平滑后原始豆温/环温逐点比对：
                 {verifyResult.rawSame ? '✅ 完全不变' : '❌ 被修改'}
-              </span>
-              <button class="ghost" style="margin-left:10px" on:click={downloadExport}>
+              </div>
+              <div>
+                校正曲线 / 校正 RoR 用同一校准版本独立重算：
+                {verifyResult.calSame ? '✅ 逐点一致' : '❌ 不一致'}
+              </div>
+              <div>
+                校准版本一致性：
+                {verifyResult.calIdsMatch ? '✅ 相同' : '❌ 不同'}
+                {#if verifyResult.calInfo?.applied?.length}
+                  （{verifyResult.calInfo.applied
+                    .map((c) => `#${c.id} v${c.version} ${CAL_CHANNEL_LABELS[c.channel]} ${c.params.gain}×T+${c.params.offset}`)
+                    .join('；')}）
+                {:else}
+                  （无生效校准，原始口径）
+                {/if}
+              </div>
+              <button class="ghost" style="margin-top:6px" on:click={downloadExport}>
                 下载导出 JSON
               </button>
             </div>

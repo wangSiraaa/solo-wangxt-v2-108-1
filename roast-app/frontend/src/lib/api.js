@@ -1,63 +1,93 @@
 // Thin API wrapper. All data is offline/synthetic — the backend never talks to
 // a roaster.
 const qs = (p) =>
-  new URLSearchParams(Object.entries(p).filter(([, v]) => v !== undefined && v !== null));
+  new URLSearchParams(
+    Object.entries(p).filter(([, v]) => v !== undefined && v !== null && v !== '')
+  );
+
+async function req(url, options) {
+  const r = await fetch(url, options);
+  if (!r.ok) {
+    let payload = null;
+    try {
+      payload = await r.json();
+    } catch {
+      /* non-JSON error body */
+    }
+    const detail = payload?.detail;
+    const msg =
+      (detail && typeof detail === 'object' ? detail.message : detail) || r.statusText;
+    const e = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    e.status = r.status;
+    e.payload = payload;
+    throw e;
+  }
+  return r.json();
+}
+
+const post = (body) => ({
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify(body),
+});
 
 export async function getBatches() {
-  const r = await fetch('/api/batches');
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return req('/api/batches');
 }
 
 export async function seed() {
-  const r = await fetch('/api/seed', { method: 'POST' });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return req('/api/seed', { method: 'POST' });
 }
 
 export async function getSeries(batchId, params = {}) {
-  const r = await fetch(`/api/batches/${batchId}/series?${qs(params)}`);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return req(`/api/batches/${batchId}/series?${qs(params)}`);
 }
 
 export async function getCompare(a, b, params = {}) {
-  const r = await fetch(`/api/compare?${qs({ a, b, ...params })}`);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return req(`/api/compare?${qs({ a, b, ...params })}`);
 }
 
 export async function addEvent(batchId, ev) {
-  const r = await fetch(`/api/batches/${batchId}/events`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(ev),
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return req(`/api/batches/${batchId}/events`, post(ev));
 }
 
 export async function listEvents(batchId, includeHistory = false) {
-  const r = await fetch(`/api/batches/${batchId}/events?${qs({ include_history: includeHistory })}`);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return req(`/api/batches/${batchId}/events?${qs({ include_history: includeHistory })}`);
 }
 
 export async function exportBatch(batchId, params = {}) {
-  const r = await fetch(`/api/batches/${batchId}/export?${qs(params)}`);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return req(`/api/batches/${batchId}/export?${qs(params)}`);
 }
 
 export async function recompute(body) {
-  const r = await fetch('/api/recompute', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return req('/api/recompute', post(body));
 }
+
+// ---------------------------------------------------------------------------
+// calibration ledger
+// ---------------------------------------------------------------------------
+
+export async function listCalibrations(batchId) {
+  return req(`/api/batches/${batchId}/calibrations`);
+}
+
+export async function createCalibration(batchId, body) {
+  return req(`/api/batches/${batchId}/calibrations`, post(body));
+}
+
+// action: activate | withdraw | supersede
+export async function calAction(calId, action, body = {}) {
+  return req(`/api/calibrations/${calId}/${action}`, post(body));
+}
+
+export const CAL_STATUS_LABELS = {
+  draft: '草稿',
+  active: '启用中',
+  withdrawn: '已撤回',
+  superseded: '已被新版本取代',
+};
+
+export const CAL_CHANNEL_LABELS = { bean: '豆温', env: '环境温度' };
 
 export const EVENT_LABELS = {
   charge: '下豆/开火',

@@ -7,11 +7,14 @@
   //  - interpolated segments use a different symbol/colour and a legend entry;
   //  - RoR is drawn on its own axis and the window basis is shown in the title;
   //  - events are markLines; damper changes get a distinct dashed gold line;
+  //  - when calibrations apply, the corrected curve/RoR are drawn alongside
+  //    the raw-basis ones (never instead of them) and each calibration's
+  //    valid range is shaded as a markArea labelled with id + version;
   //  - nothing on the chart claims the damper change caused the shape.
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import * as echarts from 'echarts';
 
-  export let payloads = []; // [{batch, series, events, metrics}]
+  export let payloads = []; // [{batch, series, events, metrics, calibration}]
   export let windowS = 30;
   export let smoothS = 12;
 
@@ -20,6 +23,7 @@
   let chart;
 
   const PALETTE = ['#e07a3f', '#4aa3df'];
+  const RAW_GREY = ['#8a7a6c', '#6c7d8a'];
   const EVENT_STYLE = {
     charge: { color: '#9a9a9a' },
     turning_point: { color: '#5fd08a' },
@@ -62,23 +66,35 @@
 
   function buildOption() {
     const series = [];
-    const legends = ['豆温(实测)', '环境温度', '温升率 RoR'];
+    const legendNames = new Set(['豆温实测点', '插值段(非实测)', '环境温度', '温升率 RoR']);
+    const anyCal = payloads.some(
+      (pl) => (pl.calibration?.applied || pl.series?.calibration?.applied || []).length > 0
+    );
+    if (anyCal) {
+      ['豆温(校正)', '原始口径豆温', 'RoR(校正)', 'RoR(原始)'].forEach((n) => legendNames.add(n));
+    }
 
     payloads.forEach((pl, bi) => {
       const c = PALETTE[bi % PALETTE.length];
+      const grey = RAW_GREY[bi % RAW_GREY.length];
       const pts = pl.series.raw_points;
+      const applied = pl.calibration?.applied || pl.series?.calibration?.applied || [];
+      const calOn = applied.length > 0;
       const measured = pts
         .filter((p) => !p.is_interpolated && p.bean_temp_c !== null)
         .map((p) => [p.t_s, p.bean_temp_c]);
 
-      // measured guide runs (solid) and interpolated runs (dashed hollow)
-      guideRuns(pts, 'bean_temp_c', false).forEach((run, ri) => {
+      // Bean guide: corrected basis is the primary solid line when a
+      // calibration applies; the raw basis stays visible as a thin grey
+      // dashed line so the difference is reviewable on the same chart.
+      const beanKey = calOn ? 'bean_temp_cal_c' : 'bean_temp_c';
+      guideRuns(pts, beanKey, false).forEach((run, ri) => {
         series.push({
-          name: ri === 0 && bi === 0 ? '豆温(实测)' : `豆温 ${pl.batch.name}`,
+          name: ri === 0 && bi === 0 ? (calOn ? '豆温(校正)' : '豆温(实测)') : `豆温 ${pl.batch.name}`,
           type: 'line',
           data: run.data,
           showSymbol: false,
-          lineStyle: { width: 2, color: c },
+          lineStyle: { width: calOn ? 2.5 : 2, color: c },
           xAxisIndex: 0,
           yAxisIndex: 0,
           z: 3,
@@ -86,20 +102,35 @@
           legendHoverLink: false,
         });
       });
+      if (calOn) {
+        guideRuns(pts, 'bean_temp_c', false).forEach((run) => {
+          series.push({
+            name: '原始口径豆温',
+            type: 'line',
+            data: run.data,
+            showSymbol: false,
+            lineStyle: { width: 1, color: grey, type: 'dashed', opacity: 0.8 },
+            xAxisIndex: 0,
+            yAxisIndex: 0,
+            z: 2,
+            tooltip: { show: false },
+          });
+        });
+      }
 
       const scatterSpec = {
         name: '豆温实测点',
         type: 'scatter',
         data: measured,
         symbolSize: 3,
-        itemStyle: { color: c },
+        itemStyle: { color: calOn ? grey : c },
         xAxisIndex: 0,
         yAxisIndex: 0,
         z: 4,
       };
       series.push(scatterSpec);
 
-      guideRuns(pts, 'bean_temp_c', true).forEach((run) => {
+      guideRuns(pts, beanKey, true).forEach((run) => {
         series.push({
           name: '插值段(非实测)',
           type: 'line',
@@ -115,31 +146,59 @@
         });
       });
 
-      // env temp (thin, muted) on its own temperature axis scale but same axis
+      // env temp (thin, muted) — corrected basis shown additionally when an
+      // env calibration applies.
+      const envCal = applied.some((k) => k.channel === 'env');
+      if (envCal) {
+        series.push({
+          name: bi === 0 ? '环境温度(校正)' : `环境温度(校正) ${pl.batch.name}`,
+          type: 'line',
+          showSymbol: false,
+          data: pair(pts, 'env_temp_cal_c'),
+          lineStyle: { width: 1.4, color: c, opacity: 0.8 },
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          z: 2,
+        });
+        legendNames.add('环境温度(校正)');
+      }
       series.push({
         name: bi === 0 ? '环境温度' : `环境温度 ${pl.batch.name}`,
         type: 'line',
         showSymbol: false,
         smooth: false,
         data: pair(pts, 'env_temp_c'),
-        lineStyle: { width: 1, color: c, opacity: 0.45, type: 'dotted' },
+        lineStyle: { width: 1, color: c, opacity: envCal ? 0.3 : 0.45, type: 'dotted' },
         xAxisIndex: 0,
         yAxisIndex: 0,
         z: 2,
       });
 
-      // RoR — display trace (window + smoothing stated in UI text)
+      // RoR — corrected basis primary when calibration applies; raw kept faint.
       series.push({
-        name: bi === 0 ? '温升率 RoR' : `RoR ${pl.batch.name}`,
+        name: bi === 0 ? (calOn ? 'RoR(校正)' : '温升率 RoR') : `RoR ${pl.batch.name}`,
         type: 'line',
         showSymbol: false,
-        data: pair(pts, 'ror_display'),
+        data: pair(pts, calOn ? 'ror_cal_display' : 'ror_display'),
         connectNulls: false,
         lineStyle: { width: 1.6, color: c, type: 'solid' },
         xAxisIndex: 0,
         yAxisIndex: 1,
         z: 1,
       });
+      if (calOn) {
+        series.push({
+          name: 'RoR(原始)',
+          type: 'line',
+          showSymbol: false,
+          data: pair(pts, 'ror_display'),
+          connectNulls: false,
+          lineStyle: { width: 1, color: grey, type: 'dotted', opacity: 0.8 },
+          xAxisIndex: 0,
+          yAxisIndex: 1,
+          z: 1,
+        });
+      }
 
       // events as markLines on first bean series — attach to measured scatter
       const markLines = pl.events
@@ -170,12 +229,33 @@
           },
         }))
       );
-      const target = scatterSpec;
-      target.markLine = {
+      scatterSpec.markLine = {
         silent: false,
         symbol: 'none',
         data: markLines,
       };
+
+      // Calibration valid ranges as shaded bands labelled with id + version,
+      // so the applied basis is reviewable directly on the curve.
+      if (applied.length) {
+        scatterSpec.markArea = {
+          silent: true,
+          itemStyle: { color: 'rgba(211, 159, 74, 0.07)' },
+          data: applied.map((k) => [
+            {
+              xAxis: k.valid_from_s,
+              label: {
+                show: true,
+                position: 'insideTop',
+                fontSize: 10,
+                color: '#c9a35f',
+                formatter: `校准#${k.id} v${k.version}·${k.channel === 'bean' ? '豆温' : '环境'}`,
+              },
+            },
+            { xAxis: k.valid_to_s },
+          ]),
+        };
+      }
     });
 
     return {
@@ -189,7 +269,7 @@
         valueFormatter: (v) => (v === null || v === undefined ? '缺测' : Number(v).toFixed(1)),
       },
       legend: {
-        data: ['豆温实测点', '插值段(非实测)', '环境温度', '温升率 RoR'],
+        data: [...legendNames],
         textStyle: { color: '#a89b8c' },
         top: 0,
       },
